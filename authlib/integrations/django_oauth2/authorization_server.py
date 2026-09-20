@@ -1,10 +1,12 @@
 from django.conf import settings
 from django.http import HttpResponse
 from django.utils.module_loading import import_string
+from django.views.decorators.http import require_POST
 
 from authlib.common.encoding import json_dumps
 from authlib.common.security import generate_token as _generate_token
 from authlib.oauth2 import AuthorizationServer as _AuthorizationServer
+from authlib.oauth2.rfc6749.errors import OAuth2Error
 from authlib.oauth2.rfc6750 import BearerTokenGenerator
 
 from .requests import DjangoJsonRequest
@@ -77,6 +79,92 @@ class AuthorizationServer(_AuthorizationServer):
             client_authenticated.send(*args, sender=self.__class__, **kwargs)
         elif name == "after_revoke_token":
             token_revoked.send(*args, sender=self.__class__, **kwargs)
+
+    def register_device_code_grant(
+        self, device_authorization_endpoint, device_code_grant
+    ):
+        """Register the OAuth 2.0 Device Authorization Grant (RFC 8628).
+
+        It registers both the ``DeviceCodeGrant`` token grant and the
+        ``DeviceAuthorizationEndpoint``. Unlike the authorization endpoint,
+        the device authorization endpoint only accepts POST requests and
+        responds with JSON (``device_code``, ``user_code``,
+        ``verification_uri``, ``expires_in`` and ``interval``) instead of an
+        OAuth redirect.
+
+        Since Django keeps URL configuration outside of the authorization
+        server, this method returns a POST-only view that developers MUST
+        wire into their ``urlpatterns`` themselves::
+
+            urlpatterns = [
+                path(
+                    "device_authorization",
+                    server.register_device_code_grant(
+                        MyDeviceAuthorizationEndpoint, MyDeviceCodeGrant
+                    ),
+                ),
+            ]
+
+        The end-user verification (confirmation) view is always registered by
+        the developer, for example::
+
+            @require_POST
+            def device_verification(request):
+                return server.create_device_authorization_response(
+                    request.user if request.user.is_authenticated else None,
+                    request,
+                )
+
+        :param device_authorization_endpoint: a ``DeviceAuthorizationEndpoint``
+            subclass.
+        :param device_code_grant: a ``DeviceCodeGrant`` subclass.
+        :return: a Django view handling POST requests for the device
+            authorization endpoint.
+        """
+        self.register_grant(device_code_grant)
+        self.register_endpoint(device_authorization_endpoint)
+
+        endpoint_name = device_authorization_endpoint.ENDPOINT_NAME
+
+        @require_POST
+        def device_authorization_view(request):
+            return self.create_endpoint_response(endpoint_name, request)
+
+        return device_authorization_view
+
+    def create_device_authorization_response(self, grant_user, request=None):
+        """Create the response for the end-user verification (confirmation)
+        page of the device authorization grant. Pass the authenticated end
+        user when the end user approves the request, or ``None`` when
+        denying it::
+
+            @require_POST
+            def device_verification(request):
+                if not request.user.is_authenticated:
+                    return redirect("login")
+                if request.POST.get("decision") == "deny":
+                    grant_user = None
+                else:
+                    grant_user = request.user
+                return server.create_device_authorization_response(
+                    grant_user, request
+                )
+
+        The endpoint responds with JSON and is idempotent: a ``user_code``
+        can only be confirmed once, repeated confirmations return the recorded
+        decision without overwriting it.
+        """
+        from authlib.oauth2.rfc8628 import DeviceAuthorizationEndpoint
+
+        oauth2_request = self.create_oauth2_request(request)
+        endpoint = self._endpoints[DeviceAuthorizationEndpoint.ENDPOINT_NAME][0]
+        try:
+            args = endpoint.create_authorization_response(
+                oauth2_request, grant_user, grant_user=grant_user
+            )
+            return self.handle_response(*args)
+        except OAuth2Error as error:
+            return self.handle_error_response(oauth2_request, error)
 
     def create_bearer_token_generator(self):
         """Default method to create BearerToken generator."""

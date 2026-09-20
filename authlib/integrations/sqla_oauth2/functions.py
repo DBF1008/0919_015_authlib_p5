@@ -28,7 +28,11 @@ def create_save_token_func(session, token_model):
         if request.user:
             user_id = request.user.get_user_id()
         else:
-            user_id = None
+            # Grants like "device_code" and "client_credentials" may issue
+            # tokens without an authenticated user. Fall back to the client
+            # owner's ``user_id`` so token models with a NOT NULL ``user_id``
+            # column can still be saved.
+            user_id = getattr(request.client, "user_id", None)
         client = request.client
         item = token_model(client_id=client.client_id, user_id=user_id, **token)
         session.add(item)

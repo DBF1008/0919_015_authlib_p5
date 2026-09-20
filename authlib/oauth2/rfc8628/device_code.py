@@ -140,12 +140,41 @@ class DeviceCodeGrant(BaseGrant, TokenEndpointMixin):
             user, approved = user_grant
             if not approved:
                 raise AccessDeniedError()
+
+            # The "device_code" can only be exchanged for an access token
+            # once. The browser confirmation and the device polling requests
+            # may hit the same "device_code" concurrently, so the
+            # consumption below MUST be an atomic compare-and-set
+            # operation.
+            if credential.is_consumed():
+                raise InvalidRequestError(
+                    "The 'device_code' has already been consumed"
+                )
+            self.consume_device_credential(credential)
             return user
 
         if self.should_slow_down(credential):
             raise SlowDownError()
 
         raise AuthorizationPendingError()
+
+    def consume_device_credential(self, credential):
+        """Mark the device credential as consumed so it cannot be exchanged
+        for another access token. The default implementation delegates to
+        ``credential.consume()``. Developers using a persistent store SHOULD
+        re-implement this method with an atomic compare-and-set operation to
+        make the consumption safe under concurrent polling requests::
+
+            def consume_device_credential(self, credential):
+                updated = DeviceCredential.query.filter_by(
+                    id=credential.id, consumed=False
+                ).update({"consumed": True})
+                if not updated:
+                    raise InvalidRequestError(
+                        "The 'device_code' has already been consumed"
+                    )
+        """
+        credential.consume()
 
     def query_device_credential(self, device_code):
         """Get device credential from previously savings via ``DeviceAuthorizationEndpoint``.
