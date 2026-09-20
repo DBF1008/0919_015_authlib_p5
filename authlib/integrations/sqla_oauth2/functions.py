@@ -25,12 +25,17 @@ def create_save_token_func(session, token_model):
     """
 
     def save_token(token, request):
-        if request.user:
-            user_id = request.user.get_user_id()
-        else:
-            user_id = None
         client = request.client
-        item = token_model(client_id=client.client_id, user_id=user_id, **token)
+        item_kwargs = {"client_id": client.client_id}
+        # Only pass "user_id" when the token is issued for an end user.
+        # Grants without a user context (e.g. the device code grant before
+        # the user is known) would otherwise write an explicit ``NULL``
+        # into the column, which breaks models with a NOT NULL constraint
+        # or a custom default on "user_id".
+        if request.user:
+            item_kwargs["user_id"] = request.user.get_user_id()
+        item_kwargs.update(token)
+        item = token_model(**item_kwargs)
         session.add(item)
         session.commit()
 

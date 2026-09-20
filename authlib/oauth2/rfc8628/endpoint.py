@@ -1,6 +1,7 @@
 from authlib.common.security import generate_token
 from authlib.common.urls import add_params_to_uri
 from authlib.consts import default_json_headers
+from authlib.oauth2.rfc6749.errors import InvalidRequestError
 
 
 class DeviceAuthorizationEndpoint:
@@ -118,6 +119,108 @@ class DeviceAuthorizationEndpoint:
             request.payload.client_id, request.payload.scope, data
         )
         return 200, data, default_json_headers
+
+    def create_authorization_response(self, request, user, grant_user=None):
+        """Handle the end-user confirmation on the verification URI
+        (RFC 8628, step (C)/(D)). This is NOT the OAuth authorization
+        endpoint: it never returns a redirect, it returns JSON.
+
+        The framework integrations expose this method as a view for the
+        end-user's browser::
+
+            @app.route("/device_verification", methods=["POST"])
+            def device_verification():
+                return server.create_device_authorization_response(
+                    current_user, request
+                )
+
+        Expected form parameters:
+
+        user_code
+            REQUIRED. The end-user code displayed by the device client.
+
+        The end-user's decision is taken from ``grant_user``: the request is
+        approved when ``grant_user`` is truthy, otherwise denied.
+
+        The method is idempotent: once a ``user_code`` has been consumed
+        (either approved or denied), repeated browser confirmations do not
+        overwrite the recorded decision and return the same JSON result.
+
+        :param request: framework HTTP request instance.
+        :param user: the authenticated end-user, or None for anonymous users.
+        :param grant_user: the end-user when approved, None when denied.
+        :return: ``(status_code, payload, headers)`` tuple.
+        """
+        if not hasattr(request, "payload"):
+            request = self.create_endpoint_request(request)
+
+        user_code = request.payload.data.get("user_code")
+        if not user_code:
+            raise InvalidRequestError("Missing 'user_code' in payload")
+
+        credential = self.query_device_credential_by_user_code(user_code)
+        if not credential:
+            raise InvalidRequestError("Invalid 'user_code' in payload")
+
+        if credential.is_expired():
+            raise InvalidRequestError("The 'user_code' has expired")
+
+        approved = bool(grant_user)
+
+        # Idempotency: the same "user_code" may be confirmed by the
+        # end-user's browser while the device is polling the token
+        # endpoint. The first recorded decision wins, repeated
+        # confirmations MUST NOT overwrite it.
+        existing = self.query_user_grant(user_code)
+        if existing is not None or credential.is_consumed():
+            return self._build_confirmation_response(user_code, credential)
+
+        self.save_user_grant(user_code, credential, user, approved)
+        return self._build_confirmation_response(user_code, credential)
+
+    def _build_confirmation_response(self, user_code, credential):
+        data = {
+            "user_code": user_code,
+            "device_code": credential.get_device_code(),
+        }
+        user_grant = self.query_user_grant(user_code)
+        if user_grant is not None:
+            _user, approved = user_grant
+            data["approved"] = bool(approved)
+        return 200, data, default_json_headers
+
+    def query_device_credential_by_user_code(self, user_code):
+        """Get device credential by ``user_code``. Developers MUST implement
+        it in subclass so that the verification endpoint can locate the
+        authorization session::
+
+            def query_device_credential_by_user_code(self, user_code):
+                return DeviceCredential.query.filter_by(
+                    user_code=user_code
+                ).first()
+        """
+        raise NotImplementedError()
+
+    def query_user_grant(self, user_code):
+        """Get the recorded end-user decision for the given ``user_code``.
+        Return ``None`` when the end-user has not confirmed yet, otherwise a
+        ``(user, approved)`` tuple. Developers SHOULD implement it in subclass
+        to enable idempotent confirmations."""
+        return None
+
+    def save_user_grant(self, user_code, credential, user, approved):
+        """Persist the end-user decision for ``user_code``. Developers MUST
+        implement it in subclass::
+
+            def save_user_grant(self, user_code, credential, user, approved):
+                item = UserGrant(
+                    user_code=user_code,
+                    user_id=user.get_user_id() if user else None,
+                    approved=approved,
+                )
+                item.save()
+        """
+        raise NotImplementedError()
 
     def generate_user_code(self):
         """A method to generate ``user_code`` value for device authorization
